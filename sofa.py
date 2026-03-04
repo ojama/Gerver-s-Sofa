@@ -29,6 +29,7 @@ Gerver's theoretical maximum area ≈ 2.2195.
 
 import argparse
 import sys
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -231,6 +232,37 @@ def _max_coverage_mask(rx: np.ndarray, ry: np.ndarray) -> tuple[np.ndarray, floa
 
 
 # ---------------------------------------------------------------------------
+# Module-level worker used by ProcessPoolExecutor
+# ---------------------------------------------------------------------------
+
+def _check_angle_worker(args: tuple) -> "np.ndarray | None":
+    """Evaluate a single rotation angle and return indices to remove.
+
+    Parameters
+    ----------
+    args :
+        (theta, vpts) where *theta* is the rotation angle in radians and
+        *vpts* is an (M, 2) array of currently-valid sofa points.
+
+    Returns
+    -------
+    np.ndarray or None
+        Indices (into *vpts*) of points that must be removed at this angle,
+        or *None* when the full set is already feasible.
+    """
+    theta, vpts = args
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    rx = vpts[:, 0] * cos_t - vpts[:, 1] * sin_t
+    ry = vpts[:, 0] * sin_t + vpts[:, 1] * cos_t
+    feasible, _, _ = find_feasible_translation(rx, ry)
+    if feasible:
+        return None
+    keep_local, _, _ = _max_coverage_mask(rx, ry)
+    return np.where(~keep_local)[0]
+
+
+# ---------------------------------------------------------------------------
 # Single-shape feasibility check
 # ---------------------------------------------------------------------------
 
@@ -280,6 +312,7 @@ def rotating_hallway_sofa(
     max_width: float = 2.0,
     resolution: int = 30,
     num_angles: int = 90,
+    num_workers: int = 1,
 ) -> tuple[float, np.ndarray]:
     """Find the approximate maximal sofa using the rotating-hallway method.
 
@@ -309,6 +342,11 @@ def rotating_hallway_sofa(
         (max_width * resolution)².
     num_angles :
         Number of rotation angles in [0, π/2].
+    num_workers :
+        Number of parallel worker processes used to evaluate rotation angles
+        within each iteration.  ``1`` (the default) disables parallelism and
+        uses the original sequential loop.  Values greater than ``1`` dispatch
+        angle evaluations to a ``ProcessPoolExecutor`` with that many workers.
 
     Returns
     -------
@@ -331,26 +369,41 @@ def rotating_hallway_sofa(
     for _iteration in range(20):
         prev_count = int(np.sum(valid))
 
-        for theta in angles:
-            cos_t = np.cos(theta)
-            sin_t = np.sin(theta)
-
+        if num_workers > 1:
+            # Parallel path: evaluate all angles concurrently, then apply
+            # the union of removals from the snapshot taken at iteration start.
             vpts = all_pts[valid]
             if len(vpts) == 0:
                 break
-
-            rx = vpts[:, 0] * cos_t - vpts[:, 1] * sin_t
-            ry = vpts[:, 0] * sin_t + vpts[:, 1] * cos_t
-
-            feasible, _, _ = find_feasible_translation(rx, ry)
-            if feasible:
-                continue  # all current points survive this angle
-
-            # Find the maximum feasible subset at this angle and
-            # invalidate points outside it.
-            keep_local, _, _ = _max_coverage_mask(rx, ry)
+            work_items = [(theta, vpts) for theta in angles]
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                results = list(executor.map(_check_angle_worker, work_items))
             valid_idx = np.where(valid)[0]
-            valid[valid_idx[~keep_local]] = False
+            for remove_local in results:
+                if remove_local is not None and len(remove_local) > 0:
+                    valid[valid_idx[remove_local]] = False
+        else:
+            # Sequential path (original behaviour)
+            for theta in angles:
+                cos_t = np.cos(theta)
+                sin_t = np.sin(theta)
+
+                vpts = all_pts[valid]
+                if len(vpts) == 0:
+                    break
+
+                rx = vpts[:, 0] * cos_t - vpts[:, 1] * sin_t
+                ry = vpts[:, 0] * sin_t + vpts[:, 1] * cos_t
+
+                feasible, _, _ = find_feasible_translation(rx, ry)
+                if feasible:
+                    continue  # all current points survive this angle
+
+                # Find the maximum feasible subset at this angle and
+                # invalidate points outside it.
+                keep_local, _, _ = _max_coverage_mask(rx, ry)
+                valid_idx = np.where(valid)[0]
+                valid[valid_idx[~keep_local]] = False
 
         if int(np.sum(valid)) == prev_count:
             break  # converged — no points removed in this pass
@@ -472,6 +525,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Number of rotation angles sampled in [0, π/2].",
     )
     p.add_argument(
+        "--num-workers", type=int, default=1,
+        help=(
+            "Number of parallel worker processes for evaluating rotation "
+            "angles.  1 (default) uses the sequential single-process path; "
+            "values > 1 dispatch angle evaluations to a ProcessPoolExecutor."
+        ),
+    )
+    p.add_argument(
         "--no-plot", action="store_true",
         help="Skip the matplotlib visualisation.",
     )
@@ -493,12 +554,14 @@ def main(argv=None) -> int:
     print(f"  max_width  : {args.max_width}")
     print(f"  resolution : {args.resolution} pts/unit  →  grid ≈ {grid_n}×{grid_n}")
     print(f"  num_angles : {args.num_angles + 1}")
+    print(f"  num_workers: {args.num_workers}")
     print()
 
     area, sofa_pts = rotating_hallway_sofa(
         max_width=args.max_width,
         resolution=args.resolution,
         num_angles=args.num_angles,
+        num_workers=args.num_workers,
     )
 
     print(f"  Sofa grid points : {len(sofa_pts)}")

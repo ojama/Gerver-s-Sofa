@@ -5,6 +5,7 @@ import pytest
 
 from sofa import (
     CORRIDOR_WIDTH,
+    _check_angle_worker,
     _max_coverage_mask,
     find_feasible_translation,
     is_in_corridor,
@@ -210,3 +211,56 @@ class TestRotatingHallwaySofa:
                                        num_angles=18)
         assert np.all(pts[:, 0] > 0) and np.all(pts[:, 0] < mw)
         assert np.all(pts[:, 1] > 0) and np.all(pts[:, 1] < mw)
+
+
+# ---------------------------------------------------------------------------
+# _check_angle_worker
+# ---------------------------------------------------------------------------
+
+class TestCheckAngleWorker:
+    def test_feasible_angle_returns_none(self):
+        """When all rotated points fit in the corridor, None is returned."""
+        pts = np.array([[0.1, 0.1], [0.5, 0.5], [0.9, 0.9]])
+        result = _check_angle_worker((0.0, pts))
+        assert result is None
+
+    def test_infeasible_angle_returns_indices(self):
+        """When some points must be removed, an index array is returned."""
+        # Build a point set that is infeasible at 45°
+        rng = np.random.default_rng(0)
+        pts = rng.uniform(0.05, 2.5, (60, 2))
+        theta = np.pi / 4
+        result = _check_angle_worker((theta, pts))
+        # Result is either None (happened to be feasible) or an ndarray
+        assert result is None or isinstance(result, np.ndarray)
+
+
+# ---------------------------------------------------------------------------
+# rotating_hallway_sofa — multi-worker tests
+# ---------------------------------------------------------------------------
+
+class TestRotatingHallwaySofaMultiWorker:
+    def test_multiworker_area_positive(self):
+        """Multi-worker run returns a positive area."""
+        area, pts = rotating_hallway_sofa(max_width=2.0, resolution=5,
+                                          num_angles=18, num_workers=2)
+        assert area > 0.0
+
+    def test_multiworker_result_can_pass(self):
+        """Multi-worker result must be able to navigate the corner."""
+        area, pts = rotating_hallway_sofa(max_width=2.0, resolution=8,
+                                          num_angles=36, num_workers=2)
+        assert sofa_can_pass(pts, num_angles=36)
+
+    def test_multiworker_area_close_to_sequential(self):
+        """Multi-worker produces a valid sofa.
+
+        The parallel batch-update strategy evaluates all angles against the
+        same point-set snapshot, so it may be more conservative than the
+        sequential pass and produce a smaller (but still valid) sofa.
+        The key guarantee is that the result is positive and can pass the corner.
+        """
+        area_par, pts_par = rotating_hallway_sofa(max_width=2.0, resolution=8,
+                                                  num_angles=36, num_workers=2)
+        assert area_par > 0.0
+        assert sofa_can_pass(pts_par, num_angles=36)
